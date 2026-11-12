@@ -1,6 +1,7 @@
 name: Plane Sync
 
 on:
+  workflow_dispatch:
   issues:
     types: [opened, edited, closed, reopened]
   issue_comment:
@@ -15,9 +16,9 @@ jobs:
     uses: gOOvER/.github/.github/workflows/plane-sync.yml@main
     with:
       plane_base_url: "https://plane.goover.dev"
-      # Optional direkt hier eintragen oder als Repository-Secret hinterlegen:
+      # Optional direkt hier eintragen (UUID, kurzes Kürzel wie "GGE", Projektname oder leer für Auto-Match per Repo-Namen):
       # plane_workspace_slug: "goover"
-      # plane_project_id: "00000000-0000-0000-0000-000000000000"
+      # plane_project_id: "GGE"
     secrets:
       PLANE_API_KEY: ${{ secrets.PLANE_API_KEY }}
       PLANE_WORKSPACE_SLUG: ${{ secrets.PLANE_WORKSPACE_SLUG }}

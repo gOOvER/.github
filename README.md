@@ -24,8 +24,8 @@ This repository contains the default [Community Health Files](https://docs.githu
    - Copy your **Workspace Slug** (from the URL `https://plane.goover.dev/<workspace-slug>/...`) and the target **Project ID** (UUID in **Project Settings**).
 2. In your **GitHub Repository** (**Settings → Secrets and variables → Actions**):
    - `PLANE_API_KEY`: Your Plane API token
-   - `PLANE_WORKSPACE_SLUG`: Your Plane workspace slug *(or pass via `with: plane_workspace_slug`)*
-   - `PLANE_PROJECT_ID`: Target Plane project UUID *(or pass via `with: plane_project_id`)*
+   - `PLANE_WORKSPACE_SLUG`: Your Plane workspace slug (or full Plane URL)
+   - `PLANE_PROJECT_ID`: Supports the **short Project ID** (e.g. `GGE`), **Project Name** (e.g. `GuildGreet-Extended`), **Project UUID**, or a **full Plane Project URL** *(optional: if omitted, automatically matches the GitHub repository name!)*
 3. Add `.github/workflows/plane-sync.yml` (or select **Plane Sync (gOOvER)** directly under **Actions → New workflow**):
 
 ```yaml

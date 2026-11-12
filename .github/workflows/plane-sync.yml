@@ -9,12 +9,12 @@ on:
         type: string
         default: "https://plane.goover.dev"
       plane_workspace_slug:
-        description: "Plane workspace slug (alternatively via PLANE_WORKSPACE_SLUG secret)"
+        description: "Plane workspace slug or URL (alternatively via PLANE_WORKSPACE_SLUG secret)"
         required: false
         type: string
         default: ""
       plane_project_id:
-        description: "Plane project UUID (alternatively via PLANE_PROJECT_ID secret)"
+        description: "Plane project UUID, short Project ID (e.g. GGE), project name, or URL (optional: defaults to GitHub repo name)"
         required: false
         type: string
         default: ""
@@ -26,7 +26,7 @@ on:
         description: "Optional fallback if plane_workspace_slug input is not set"
         required: false
       PLANE_PROJECT_ID:
-        description: "Optional fallback if plane_project_id input is not set"
+        description: "Optional fallback if plane_project_id input is not set (UUID, short code, name, or URL)"
         required: false
       PLANE_BASE_URL:
         description: "Optional override for plane_base_url"
@@ -54,14 +54,42 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const baseUrl = (process.env.PLANE_BASE_URL || "").trim().replace(/\/+$/, "");
-            const workspaceSlug = (process.env.PLANE_WORKSPACE_SLUG || "").trim();
-            const projectId = (process.env.PLANE_PROJECT_ID || "").trim();
+            let rawBaseUrl = (process.env.PLANE_BASE_URL || "https://plane.goover.dev").trim();
+            // Strip accidental /api or workspace paths if someone pasted a deeper URL into PLANE_BASE_URL
+            try {
+              const parsedBase = new URL(rawBaseUrl);
+              rawBaseUrl = parsedBase.origin;
+            } catch {
+              rawBaseUrl = rawBaseUrl.replace(/\/+$/, "");
+            }
+            const baseUrl = rawBaseUrl;
+
+            let rawWorkspaceSlug = (process.env.PLANE_WORKSPACE_SLUG || "").trim();
+            const rawProjectInput = (process.env.PLANE_PROJECT_ID || "").trim();
             const apiKey = (process.env.PLANE_API_KEY || "").trim();
 
-            if (!baseUrl || !workspaceSlug || !projectId || !apiKey) {
+            // Allow pasting a full Plane URL into PLANE_WORKSPACE_SLUG or extracting slug from PLANE_PROJECT_ID URL
+            function extractSlugFromUrl(val) {
+              try {
+                if (/^https?:\/\//i.test(val)) {
+                  const u = new URL(val);
+                  const segs = u.pathname.split("/").filter(Boolean);
+                  if (segs.length > 0 && segs[0] !== "god-mode" && segs[0] !== "spaces") {
+                    return segs[0];
+                  }
+                }
+              } catch {}
+              return val.replace(/^\/+|\/+$/g, "").split("/")[0] || "";
+            }
+
+            let workspaceSlug = extractSlugFromUrl(rawWorkspaceSlug);
+            if (!workspaceSlug && /^https?:\/\//i.test(rawProjectInput)) {
+              workspaceSlug = extractSlugFromUrl(rawProjectInput);
+            }
+
+            if (!baseUrl || !workspaceSlug || !apiKey) {
               core.setFailed(
-                "Missing Plane configuration. Ensure PLANE_API_KEY, PLANE_WORKSPACE_SLUG, and PLANE_PROJECT_ID are configured."
+                "Missing Plane configuration. Ensure PLANE_API_KEY and PLANE_WORKSPACE_SLUG are configured."
               );
               return;
             }
@@ -111,17 +139,95 @@ jobs:
                   core.info(`Link already attached on Plane work item, skipping.`);
                   return null;
                 }
-                throw new Error(`Plane API ${method} ${apiPath} failed (${res.status}): ${text}`);
+                const err = new Error(`Plane API ${method} ${apiPath} failed (${res.status}): ${text}`);
+                err.status = res.status;
+                throw err;
               }
               return data;
             }
 
-            // 1. Load project metadata & workflow states
-            const project = await planeRequest(
-              "GET",
-              `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/`
+            // 1. Resolve workspace & project flexibly (supports UUID, short Project ID like "GGE", project name, full Plane URL, or auto-matching repo name)
+            async function listWorkspaceProjects(slug) {
+              const res = await planeRequest("GET", `/workspaces/${encodeURIComponent(slug)}/projects/`);
+              return Array.isArray(res) ? res : res?.results || [];
+            }
+
+            let projects = [];
+            try {
+              projects = await listWorkspaceProjects(workspaceSlug);
+            } catch (err) {
+              if (err.status === 404 && workspaceSlug !== workspaceSlug.toLowerCase()) {
+                core.info(`Retrying workspace slug in lowercase: ${workspaceSlug.toLowerCase()}`);
+                workspaceSlug = workspaceSlug.toLowerCase();
+                projects = await listWorkspaceProjects(workspaceSlug);
+              } else {
+                throw new Error(
+                  `Could not load projects for workspace '${workspaceSlug}' at ${baseUrl}. Verify PLANE_WORKSPACE_SLUG (exact slug from URL https://plane.goover.dev/<slug>/...) and PLANE_API_KEY. Original error: ${err.message}`
+                );
+              }
+            }
+
+            const uuidMatch = rawProjectInput.match(
+              /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
             );
-            const projectIdentifier = (project.identifier || "").toUpperCase();
+            const candidateUuid = uuidMatch ? uuidMatch[0].toLowerCase() : "";
+            const normalizedInput = rawProjectInput.trim().toLowerCase();
+            const normalizedRepoName = context.repo.repo.toLowerCase();
+
+            let project = null;
+            if (candidateUuid) {
+              project = projects.find((p) => String(p.id).toLowerCase() === candidateUuid) || null;
+              if (!project) {
+                // Fallback direct fetch in case project list is paginated
+                project = await planeRequest(
+                  "GET",
+                  `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(candidateUuid)}/`
+                );
+              }
+            } else if (normalizedInput) {
+              project =
+                projects.find((p) => String(p.identifier || "").toLowerCase() === normalizedInput) ||
+                projects.find((p) => String(p.name || "").toLowerCase() === normalizedInput) ||
+                projects.find(
+                  (p) =>
+                    String(p.name || "")
+                      .toLowerCase()
+                      .replace(/[\s_-]+/g, "") === normalizedInput.replace(/[\s_-]+/g, "")
+                ) ||
+                null;
+            } else {
+              // Auto-match by GitHub repository name if PLANE_PROJECT_ID is omitted
+              project =
+                projects.find((p) => String(p.name || "").toLowerCase() === normalizedRepoName) ||
+                projects.find(
+                  (p) =>
+                    String(p.name || "")
+                      .toLowerCase()
+                      .replace(/[\s_-]+/g, "") === normalizedRepoName.replace(/[\s_-]+/g, "")
+                ) ||
+                null;
+            }
+
+            if (!project) {
+              const available = projects
+                .map((p) => `"${p.name}" [Identifier: ${p.identifier}, UUID: ${p.id}]`)
+                .join(", ");
+              core.setFailed(
+                `Plane project "${rawProjectInput || context.repo.repo}" not found in workspace "${workspaceSlug}". Available projects: ${available || "(none)"}`
+              );
+              return;
+            }
+
+            const projectId = project.id;
+            const projectIdentifier = String(project.identifier || "").toUpperCase();
+            core.info(
+              `✅ Connected to Plane Workspace "${workspaceSlug}" -> Project "${project.name}" [${projectIdentifier}] (${projectId})`
+            );
+
+            if (context.eventName === "workflow_dispatch") {
+              core.info("Manual workflow_dispatch connection check succeeded.");
+              return;
+            }
 
             const statesRes = await planeRequest(
               "GET",
