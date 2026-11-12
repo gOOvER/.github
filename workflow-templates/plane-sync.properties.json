@@ -1,0 +1,6 @@
+{
+  "name": "Plane Sync (gOOvER)",
+  "description": "Synchronisiert GitHub Issues, Kommentare, Pull Requests und Commits automatisch mit deiner selbstgehosteten Plane-Instanz (https://plane.goover.dev).",
+  "iconName": "octicon project",
+  "categories": ["Automation", "Project Management"]
+}

@@ -1,0 +1,378 @@
+name: Plane Sync (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      plane_base_url:
+        description: "Base URL of the self-hosted Plane instance"
+        required: false
+        type: string
+        default: "https://plane.goover.dev"
+      plane_workspace_slug:
+        description: "Plane workspace slug (alternatively via PLANE_WORKSPACE_SLUG secret)"
+        required: false
+        type: string
+        default: ""
+      plane_project_id:
+        description: "Plane project UUID (alternatively via PLANE_PROJECT_ID secret)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      PLANE_API_KEY:
+        description: "Plane Personal/Workspace API Token (X-API-Key)"
+        required: true
+      PLANE_WORKSPACE_SLUG:
+        description: "Optional fallback if plane_workspace_slug input is not set"
+        required: false
+      PLANE_PROJECT_ID:
+        description: "Optional fallback if plane_project_id input is not set"
+        required: false
+      PLANE_BASE_URL:
+        description: "Optional override for plane_base_url"
+        required: false
+
+concurrency:
+  group: plane-sync-${{ github.repository }}-${{ github.event_name }}-${{ github.event.issue.number || github.event.pull_request.number || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  sync-to-plane:
+    name: Sync GitHub Event to Plane
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    env:
+      PLANE_BASE_URL: ${{ secrets.PLANE_BASE_URL || inputs.plane_base_url || 'https://plane.goover.dev' }}
+      PLANE_WORKSPACE_SLUG: ${{ inputs.plane_workspace_slug || secrets.PLANE_WORKSPACE_SLUG }}
+      PLANE_PROJECT_ID: ${{ inputs.plane_project_id || secrets.PLANE_PROJECT_ID }}
+      PLANE_API_KEY: ${{ secrets.PLANE_API_KEY }}
+    steps:
+      - name: Sync with Plane REST API v1
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const baseUrl = (process.env.PLANE_BASE_URL || "").trim().replace(/\/+$/, "");
+            const workspaceSlug = (process.env.PLANE_WORKSPACE_SLUG || "").trim();
+            const projectId = (process.env.PLANE_PROJECT_ID || "").trim();
+            const apiKey = (process.env.PLANE_API_KEY || "").trim();
+
+            if (!baseUrl || !workspaceSlug || !projectId || !apiKey) {
+              core.setFailed(
+                "Missing Plane configuration. Ensure PLANE_API_KEY, PLANE_WORKSPACE_SLUG, and PLANE_PROJECT_ID are configured."
+              );
+              return;
+            }
+
+            const repoFullName = `${context.repo.owner}/${context.repo.repo}`;
+
+            function escapeHtml(str) {
+              return String(str || "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#39;");
+            }
+
+            function toSafeHtml(bodyText, headerHtml = "") {
+              const formatted = escapeHtml(bodyText || "").replace(/\r?\n/g, "<br />");
+              const content = formatted ? `<p>${formatted}</p>` : "<p><em>Keine Beschreibung angegeben.</em></p>";
+              return `<div>${headerHtml}${content}</div>`;
+            }
+
+            async function planeRequest(method, apiPath, body = undefined, ignoreDuplicateLink = false) {
+              const url = `${baseUrl}/api/v1${apiPath}`;
+              const options = {
+                method,
+                headers: {
+                  "X-API-Key": apiKey,
+                  "Accept": "application/json",
+                },
+              };
+              if (body !== undefined) {
+                options.headers["Content-Type"] = "application/json";
+                options.body = JSON.stringify(body);
+              }
+
+              const res = await fetch(url, options);
+              const text = await res.text();
+              let data = null;
+              try {
+                data = text ? JSON.parse(text) : null;
+              } catch {
+                data = { raw: text };
+              }
+
+              if (!res.ok) {
+                if (ignoreDuplicateLink && res.status === 400 && text.includes("already exists")) {
+                  core.info(`Link already attached on Plane work item, skipping.`);
+                  return null;
+                }
+                throw new Error(`Plane API ${method} ${apiPath} failed (${res.status}): ${text}`);
+              }
+              return data;
+            }
+
+            // 1. Load project metadata & workflow states
+            const project = await planeRequest(
+              "GET",
+              `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/`
+            );
+            const projectIdentifier = (project.identifier || "").toUpperCase();
+
+            const statesRes = await planeRequest(
+              "GET",
+              `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/states/`
+            );
+            const states = Array.isArray(statesRes) ? statesRes : statesRes?.results || [];
+
+            function findStateId(groups) {
+              for (const grp of groups) {
+                const defaultMatch = states.find((s) => s.group === grp && s.default);
+                if (defaultMatch) return defaultMatch.id;
+                const firstMatch = states.find((s) => s.group === grp);
+                if (firstMatch) return firstMatch.id;
+              }
+              return states[0]?.id || undefined;
+            }
+
+            async function findWorkItemByGithubIssue(issueNumber) {
+              const extId = `${repoFullName}#${issueNumber}`;
+              const query = `?external_source=github-issue&external_id=${encodeURIComponent(extId)}`;
+              const res = await planeRequest(
+                "GET",
+                `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/work-items/${query}`
+              );
+              const items = Array.isArray(res) ? res : res?.results || [];
+              return items.find((item) => item.external_id === extId) || null;
+            }
+
+            async function findWorkItemByIdentifier(identifierStr) {
+              try {
+                return await planeRequest(
+                  "GET",
+                  `/workspaces/${encodeURIComponent(workspaceSlug)}/work-items/${encodeURIComponent(identifierStr)}/`
+                );
+              } catch (err) {
+                core.warning(`Could not resolve Plane identifier ${identifierStr}: ${err.message}`);
+                return null;
+              }
+            }
+
+            async function attachLink(workItemId, title, url) {
+              await planeRequest(
+                "POST",
+                `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(workItemId)}/links/`,
+                { title, url },
+                true
+              );
+            }
+
+            async function addComment(workItemId, commentHtml, externalSource = undefined, externalId = undefined) {
+              const payload = { comment_html: commentHtml };
+              if (externalSource) payload.external_source = externalSource;
+              if (externalId) payload.external_id = externalId;
+              await planeRequest(
+                "POST",
+                `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(workItemId)}/comments/`,
+                payload
+              );
+            }
+
+            function extractPlaneIdentifiers(text) {
+              if (!projectIdentifier || !text) return [];
+              const escaped = projectIdentifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const regex = new RegExp(`\\b(${escaped}-\\d+)\\b`, "gi");
+              const matches = new Set();
+              let m;
+              while ((m = regex.exec(text)) !== null) {
+                matches.add(m[1].toUpperCase());
+              }
+              return [...matches];
+            }
+
+            function extractGithubIssueNumbers(text) {
+              if (!text) return [];
+              const regex = /(?:^|\s|Fixes|Closes|Resolves)#(\d+)\b/gi;
+              const nums = new Set();
+              let m;
+              while ((m = regex.exec(text)) !== null) {
+                nums.add(Number(m[1]));
+              }
+              return [...nums];
+            }
+
+            const eventName = context.eventName;
+            const payload = context.payload;
+
+            // --- CASE 1: GitHub Issues ---
+            if (eventName === "issues" && payload.issue) {
+              const issue = payload.issue;
+              const action = payload.action;
+              const extId = `${repoFullName}#${issue.number}`;
+              const header = `<p><strong>GitHub Issue:</strong> <a href="${escapeHtml(issue.html_url)}">${escapeHtml(repoFullName)}#${issue.number}</a> (von @${escapeHtml(issue.user?.login || "unknown")})</p><hr />`;
+              const descriptionHtml = toSafeHtml(issue.body, header);
+              const title = `[#${issue.number}] ${issue.title}`;
+
+              let workItem = await findWorkItemByGithubIssue(issue.number);
+
+              if (!workItem) {
+                const initialState =
+                  issue.state === "closed"
+                    ? findStateId(issue.state_reason === "not_planned" ? ["cancelled", "completed"] : ["completed"])
+                    : findStateId(["unstarted", "backlog"]);
+
+                workItem = await planeRequest(
+                  "POST",
+                  `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/work-items/`,
+                  {
+                    name: title,
+                    description_html: descriptionHtml,
+                    state: initialState,
+                    external_source: "github-issue",
+                    external_id: extId,
+                  }
+                );
+                await attachLink(workItem.id, `GitHub Issue #${issue.number}`, issue.html_url);
+                core.info(`Created Plane work item ${projectIdentifier}-${workItem.sequence_id} for GitHub Issue #${issue.number}`);
+              } else {
+                const patch = {};
+                if (action === "edited") {
+                  patch.name = title;
+                  patch.description_html = descriptionHtml;
+                } else if (action === "closed") {
+                  patch.state = findStateId(
+                    issue.state_reason === "not_planned" ? ["cancelled", "completed"] : ["completed"]
+                  );
+                } else if (action === "reopened") {
+                  patch.state = findStateId(["unstarted", "backlog"]);
+                }
+
+                if (Object.keys(patch).length > 0) {
+                  await planeRequest(
+                    "PATCH",
+                    `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(workItem.id)}/`,
+                    patch
+                  );
+                  core.info(`Updated Plane work item ${workItem.id} (${action})`);
+                }
+              }
+            }
+
+            // --- CASE 2: GitHub Issue Comments ---
+            else if (eventName === "issue_comment" && payload.action === "created" && payload.issue && payload.comment) {
+              if (payload.comment.user?.type === "Bot") {
+                core.info("Skipping bot comment.");
+                return;
+              }
+              const workItem = await findWorkItemByGithubIssue(payload.issue.number);
+              if (!workItem) {
+                core.info(`No synced Plane work item found for GitHub #${payload.issue.number}, skipping comment.`);
+                return;
+              }
+              const header = `<p><strong>@${escapeHtml(payload.comment.user?.login)}</strong> kommentierte auf <a href="${escapeHtml(payload.comment.html_url)}">GitHub #${payload.issue.number}</a>:</p>`;
+              await addComment(
+                workItem.id,
+                toSafeHtml(payload.comment.body, header),
+                "github-comment",
+                `${repoFullName}#comment-${payload.comment.id}`
+              );
+              core.info(`Synced GitHub comment ${payload.comment.id} to Plane work item ${workItem.id}`);
+            }
+
+            // --- CASE 3: GitHub Pull Requests ---
+            else if (eventName === "pull_request" && payload.pull_request) {
+              const pr = payload.pull_request;
+              const action = payload.action;
+              const combinedText = `${pr.title || ""}\n${pr.head?.ref || ""}\n${pr.body || ""}`;
+
+              const targetItems = new Map();
+
+              for (const idStr of extractPlaneIdentifiers(combinedText)) {
+                const item = await findWorkItemByIdentifier(idStr);
+                if (item && item.project === projectId) {
+                  targetItems.set(item.id, item);
+                }
+              }
+
+              for (const issueNum of extractGithubIssueNumbers(`${pr.title || ""}\n${pr.body || ""}`)) {
+                const item = await findWorkItemByGithubIssue(issueNum);
+                if (item) {
+                  targetItems.set(item.id, item);
+                }
+              }
+
+              if (targetItems.size === 0) {
+                core.info(`No Plane work items referenced in PR #${pr.number}.`);
+                return;
+              }
+
+              for (const item of targetItems.values()) {
+                await attachLink(item.id, `GitHub PR #${pr.number}: ${pr.title}`, pr.html_url);
+
+                if (["opened", "reopened", "ready_for_review"].includes(action) && !pr.draft) {
+                  const startedState = findStateId(["started"]);
+                  if (startedState) {
+                    await planeRequest(
+                      "PATCH",
+                      `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(item.id)}/`,
+                      { state: startedState }
+                    );
+                  }
+                  await addComment(
+                    item.id,
+                    `<div><p>🔀 Pull Request <a href="${escapeHtml(pr.html_url)}">#${pr.number} (${escapeHtml(pr.title)})</a> wurde von <strong>@${escapeHtml(pr.user?.login)}</strong> geöffnet.</p></div>`
+                  );
+                } else if (action === "closed" && pr.merged) {
+                  const completedState = findStateId(["completed"]);
+                  if (completedState) {
+                    await planeRequest(
+                      "PATCH",
+                      `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(item.id)}/`,
+                      { state: completedState }
+                    );
+                  }
+                  await addComment(
+                    item.id,
+                    `<div><p>✅ Pull Request <a href="${escapeHtml(pr.html_url)}">#${pr.number} (${escapeHtml(pr.title)})</a> wurde gemergt.</p></div>`
+                  );
+                }
+              }
+            }
+
+            // --- CASE 4: Push Commits referencing PROJ-123 ---
+            else if (eventName === "push" && Array.isArray(payload.commits)) {
+              for (const commit of payload.commits) {
+                const msg = commit.message || "";
+                const ids = extractPlaneIdentifiers(msg);
+                if (ids.length === 0) continue;
+
+                const shouldClose = /\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s+[A-Z0-9]+-\d+\b/i.test(msg);
+
+                for (const idStr of ids) {
+                  const item = await findWorkItemByIdentifier(idStr);
+                  if (!item || item.project !== projectId) continue;
+
+                  const shortSha = String(commit.id || "").slice(0, 7);
+                  const firstLine = msg.split(/\r?\n/)[0];
+                  await addComment(
+                    item.id,
+                    `<div><p>📌 Commit <a href="${escapeHtml(commit.url)}"><code>${escapeHtml(shortSha)}</code></a> von <strong>${escapeHtml(commit.author?.name || "Git")}</strong>: ${escapeHtml(firstLine)}</p></div>`
+                  );
+
+                  if (shouldClose) {
+                    const completedState = findStateId(["completed"]);
+                    if (completedState) {
+                      await planeRequest(
+                        "PATCH",
+                        `/workspaces/${encodeURIComponent(workspaceSlug)}/projects/${encodeURIComponent(projectId)}/work-items/${encodeURIComponent(item.id)}/`,
+                        { state: completedState }
+                      );
+                    }
+                  }
+                }
+              }
+            }
