@@ -10,6 +10,7 @@ This repository contains the default [Community Health Files](https://docs.githu
 | [`SECURITY.md`](SECURITY.md) | Default security vulnerability reporting policy |
 | [`SUPPORT.md`](SUPPORT.md) | Default support & help resources |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Default contribution guidelines |
+| [`CONTRIBUTORS.md`](CONTRIBUTORS.md) | Global contributors & maintainer attribution template |
 | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Contributor Covenant Code of Conduct |
 | [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) | Global Bug Report & Feature Request issue forms |
 | [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) | Global Pull Request template |

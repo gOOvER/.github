@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Global `CONTRIBUTORS.md` & Logo/Social-Banner Standard**: Added global [`CONTRIBUTORS.md`](CONTRIBUTORS.md) template and updated [`GEMINI.md`](GEMINI.md) and [`rules/changelog.md`](rules/changelog.md) so every repository automatically maintains `CONTRIBUTORS.md`, `.github/assets/logo.png` (`.svg`), and `.github/assets/social-banner.png` (`1280×640`).
 - **Plane Integration**: Added global reusable workflow [`.github/workflows/plane-sync.yml`](.github/workflows/plane-sync.yml) to synchronize GitHub Issues, Issue Comments, Pull Requests, and Commits (`PROJ-123` / `fixes PROJ-123`) with self-hosted Plane (`https://plane.goover.dev`) via Plane REST API v1.
 - **Starter Workflow Template**: Added [`workflow-templates/plane-sync.yml`](workflow-templates/plane-sync.yml) and [`workflow-templates/plane-sync.properties.json`](workflow-templates/plane-sync.properties.json) for 1-click setup across all `gOOvER` repositories.
 
